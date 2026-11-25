@@ -1,0 +1,920 @@
+/**
+ * Meridian Voice Receptionist
+ * Single-file voice receptionist server and browser console.
+ *
+ * Run with:
+ *   GEMINI_API_KEY="your_key" npx tsx receptionist.ts
+ */
+
+import http from "node:http";
+import express from "express";
+import dotenv from "dotenv";
+import { WebSocketServer, WebSocket } from "ws";
+import {
+  FunctionDeclaration,
+  GoogleGenAI,
+  LiveServerMessage,
+  Modality,
+  Type,
+} from "@google/genai";
+
+dotenv.config();
+
+// ---------------------------------------------------------------------------
+// Domain Types
+// ---------------------------------------------------------------------------
+
+interface BusinessProfile {
+  name: string;
+  phone: string;
+  address: string;
+  parking: string;
+  hours: Record<string, string>;
+  services: Array<{ name: string; durationMinutes: number; price: string }>;
+  insuranceAccepted: string[];
+  cancellationPolicy: string;
+}
+
+interface Appointment {
+  id: string;
+  callerName: string;
+  callerPhone: string;
+  service: string;
+  date: string;
+  time: string;
+  notes: string;
+  status: "Confirmed" | "Cancelled";
+  createdAt: string;
+}
+
+interface TransferRecord {
+  id: string;
+  callId: string;
+  department: string;
+  extension: string;
+  callerName: string;
+  reason: string;
+  priority: "Standard" | "Urgent";
+  summary: string;
+  timestamp: string;
+}
+
+interface TranscriptEntry {
+  id: string;
+  speaker: "Caller" | "Receptionist" | "System";
+  text: string;
+  timestamp: string;
+  interrupted?: boolean;
+}
+
+interface CallRecord {
+  id: string;
+  callerNumber: string;
+  startedAt: string;
+  endedAt?: string;
+  status: "Active" | "Completed" | "Transferred";
+  interruptionCount: number;
+  transcript: TranscriptEntry[];
+  actions: string[];
+}
+
+// ---------------------------------------------------------------------------
+// In-Memory State (Business Knowledge Base, Schedule, Transfers, Call Logs)
+// ---------------------------------------------------------------------------
+
+const BUSINESS: BusinessProfile = {
+  name: "Meridian Health & Dental Clinic",
+  phone: "(415) 555-0194",
+  address: "420 Sutter Street, Suite 300, San Francisco, CA 94108",
+  parking: "Validated 2-hour underground parking is available at the Sutter-Stockton Garage.",
+  hours: {
+    "Monday - Friday": "8:00 AM - 6:00 PM",
+    Saturday: "9:00 AM - 2:00 PM",
+    Sunday: "Closed",
+  },
+  services: [
+    { name: "Routine Dental Cleaning", durationMinutes: 45, price: "$145" },
+    { name: "New Patient Consultation", durationMinutes: 30, price: "$95" },
+    { name: "Annual Physical Exam", durationMinutes: 45, price: "$180" },
+    { name: "Diagnostic X-Ray & Review", durationMinutes: 30, price: "$120" },
+    { name: "Same-Day Urgent Visit", durationMinutes: 30, price: "$160" },
+  ],
+  insuranceAccepted: ["Delta Dental", "Blue Shield", "Aetna", "Cigna", "UnitedHealthcare"],
+  cancellationPolicy: "Please provide at least 24 hours notice to reschedule or cancel without a $35 late fee.",
+};
+
+const DEPARTMENTS: Record<string, { name: string; extension: string }> = {
+  billing: { name: "Billing & Insurance", extension: "204" },
+  clinical: { name: "Clinical Triage Nurse", extension: "310" },
+  manager: { name: "Front Office Manager", extension: "105" },
+  urgent: { name: "Urgent Care Desk", extension: "911" },
+};
+
+const DAILY_SLOTS = [
+  "09:00 AM",
+  "10:00 AM",
+  "11:00 AM",
+  "01:00 PM",
+  "02:00 PM",
+  "03:30 PM",
+  "04:30 PM",
+];
+
+const appointments: Appointment[] = [
+  {
+    id: "APT-1041",
+    callerName: "Hannah Mercer",
+    callerPhone: "(415) 555-0132",
+    service: "Routine Dental Cleaning",
+    date: "2026-11-25",
+    time: "10:00 AM",
+    notes: "Annual hygiene visit",
+    status: "Confirmed",
+    createdAt: "2026-11-24T16:20:00Z",
+  },
+  {
+    id: "APT-1042",
+    callerName: "David Okafor",
+    callerPhone: "(415) 555-0188",
+    service: "New Patient Consultation",
+    date: "2026-11-25",
+    time: "02:00 PM",
+    notes: "Transferred from Oak Street Practice",
+    status: "Confirmed",
+    createdAt: "2026-11-24T17:05:00Z",
+  },
+];
+
+const transfers: TransferRecord[] = [];
+const callHistory: CallRecord[] = [];
+
+function createId(prefix: string): string {
+  return `${prefix}-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+// ---------------------------------------------------------------------------
+// Receptionist Tool Definitions & Execution
+// ---------------------------------------------------------------------------
+
+const RECEPTIONIST_TOOLS: FunctionDeclaration[] = [
+  {
+    name: "get_business_info",
+    description:
+      "Retrieves business hours, address, parking, services, pricing, accepted insurance, or cancellation policy.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        topic: {
+          type: Type.STRING,
+          description:
+            "One of: hours, location, parking, services, pricing, insurance, policy, all",
+        },
+      },
+      required: ["topic"],
+    },
+  },
+  {
+    name: "check_availability",
+    description: "Checks available appointment time slots for a specific date (YYYY-MM-DD).",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        date: {
+          type: Type.STRING,
+          description: "Requested date in YYYY-MM-DD format.",
+        },
+      },
+      required: ["date"],
+    },
+  },
+  {
+    name: "schedule_appointment",
+    description: "Books a new clinic appointment after verifying caller name, service, date, and time.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        callerName: { type: Type.STRING, description: "Full name of the caller." },
+        callerPhone: { type: Type.STRING, description: "Callback phone number." },
+        service: { type: Type.STRING, description: "Requested clinic service." },
+        date: { type: Type.STRING, description: "Appointment date in YYYY-MM-DD format." },
+        time: { type: Type.STRING, description: "Appointment time, e.g. 02:00 PM." },
+        notes: { type: Type.STRING, description: "Optional notes from the caller." },
+      },
+      required: ["callerName", "service", "date", "time"],
+    },
+  },
+  {
+    name: "cancel_appointment",
+    description: "Cancels an existing appointment using the confirmation ID or caller name.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        appointmentId: { type: Type.STRING, description: "Appointment ID like APT-1041." },
+        callerName: { type: Type.STRING, description: "Caller full name if ID is unknown." },
+      },
+    },
+  },
+  {
+    name: "transfer_call",
+    description:
+      "Transfers the caller to a human specialist when a request involves billing disputes, clinical medical advice, emergencies, or manager escalation.",
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        department: {
+          type: Type.STRING,
+          description: "Target department key: billing, clinical, manager, or urgent.",
+        },
+        callerName: { type: Type.STRING, description: "Caller name if known." },
+        reason: { type: Type.STRING, description: "Short reason for the transfer." },
+        priority: { type: Type.STRING, description: "Standard or Urgent." },
+        summary: { type: Type.STRING, description: "Brief context summary for the receiving specialist." },
+      },
+      required: ["department", "reason", "summary"],
+    },
+  },
+];
+
+function executeTool(
+  name: string,
+  args: Record<string, unknown>,
+  call: CallRecord
+): Record<string, unknown> {
+  if (name === "get_business_info") {
+    const topic = String(args.topic ?? "all").toLowerCase();
+    call.actions.push(`Looked up business info (${topic})`);
+    if (topic === "hours") return { hours: BUSINESS.hours };
+    if (topic === "location" || topic === "parking") {
+      return { address: BUSINESS.address, parking: BUSINESS.parking };
+    }
+    if (topic === "services" || topic === "pricing") {
+      return { services: BUSINESS.services };
+    }
+    if (topic === "insurance") return { insuranceAccepted: BUSINESS.insuranceAccepted };
+    if (topic === "policy") return { cancellationPolicy: BUSINESS.cancellationPolicy };
+    return { business: BUSINESS };
+  }
+
+  if (name === "check_availability") {
+    const date = String(args.date ?? "2026-11-25");
+    const bookedTimes = new Set(
+      appointments
+        .filter((a) => a.date === date && a.status === "Confirmed")
+        .map((a) => a.time.toUpperCase())
+    );
+    const availableSlots = DAILY_SLOTS.filter((slot) => !bookedTimes.has(slot.toUpperCase()));
+    call.actions.push(`Checked availability for ${date}`);
+    return { date, availableSlots };
+  }
+
+  if (name === "schedule_appointment") {
+    const date = String(args.date ?? "");
+    const time = String(args.time ?? "");
+    const conflict = appointments.find(
+      (a) =>
+        a.date === date &&
+        a.time.toUpperCase() === time.toUpperCase() &&
+        a.status === "Confirmed"
+    );
+    if (conflict) {
+      return {
+        booked: false,
+        error: `The ${time} slot on ${date} is already reserved. Please offer another slot.`,
+      };
+    }
+
+    const record: Appointment = {
+      id: createId("APT"),
+      callerName: String(args.callerName ?? "Unknown Caller"),
+      callerPhone: String(args.callerPhone ?? call.callerNumber),
+      service: String(args.service ?? "New Patient Consultation"),
+      date,
+      time,
+      notes: String(args.notes ?? ""),
+      status: "Confirmed",
+      createdAt: new Date().toISOString(),
+    };
+    appointments.unshift(record);
+    call.actions.push(`Scheduled ${record.id} for ${record.callerName} (${date} ${time})`);
+    return { booked: true, appointment: record };
+  }
+
+  if (name === "cancel_appointment") {
+    const id = String(args.appointmentId ?? "").toUpperCase();
+    const callerName = String(args.callerName ?? "").toLowerCase();
+    const match = appointments.find(
+      (a) =>
+        a.status === "Confirmed" &&
+        ((id && a.id.toUpperCase() === id) ||
+          (callerName && a.callerName.toLowerCase().includes(callerName)))
+    );
+    if (!match) {
+      return { cancelled: false, message: "No matching confirmed appointment found." };
+    }
+    match.status = "Cancelled";
+    call.actions.push(`Cancelled appointment ${match.id}`);
+    return { cancelled: true, appointment: match };
+  }
+
+  if (name === "transfer_call") {
+    const deptKey = String(args.department ?? "manager").toLowerCase();
+    const target = DEPARTMENTS[deptKey] ?? DEPARTMENTS.manager;
+    const record: TransferRecord = {
+      id: createId("TRF"),
+      callId: call.id,
+      department: target.name,
+      extension: target.extension,
+      callerName: String(args.callerName ?? "Caller"),
+      reason: String(args.reason ?? "Complex inquiry"),
+      priority: String(args.priority ?? "Standard") === "Urgent" ? "Urgent" : "Standard",
+      summary: String(args.summary ?? ""),
+      timestamp: new Date().toISOString(),
+    };
+    transfers.unshift(record);
+    call.status = "Transferred";
+    call.actions.push(`Transferred to ${target.name} (Ext. ${target.extension})`);
+    return {
+      transferred: true,
+      department: target.name,
+      extension: target.extension,
+      transferId: record.id,
+    };
+  }
+
+  return { error: `Unknown tool: ${name}` };
+}
+
+function buildSystemInstruction(): string {
+  return [
+    `You are the front-desk phone receptionist for ${BUSINESS.name}.`,
+    "Speak clearly, warmly, and concisely as on a real telephone call (1 to 3 short sentences per turn).",
+    "Never use markdown formatting, bullet lists, or asterisks in spoken responses.",
+    "Maintain full context across the entire call so callers do not have to repeat details.",
+    "Answer common business questions using get_business_info.",
+    "Before booking an appointment, check availability using check_availability and collect the caller's full name, requested service, preferred date, and time, then call schedule_appointment.",
+    "For billing disputes, medical advice, urgent symptoms, or supervisor requests, briefly acknowledge the issue and call transfer_call with a clear summary for the receiving department.",
+    "If the caller interrupts you mid-sentence, immediately stop your previous thought and address their new statement directly.",
+    `Today's reference date is ${new Date().toISOString().slice(0, 10)}.`,
+  ].join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// Server Setup
+// ---------------------------------------------------------------------------
+
+const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey) {
+  console.warn("GEMINI_API_KEY is not set. Set it in your environment before placing voice calls.");
+}
+
+const client = new GoogleGenAI({
+  apiKey: apiKey ?? "",
+  httpOptions: {
+    headers: { "User-Agent": "aistudio-build" },
+  },
+});
+
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+
+// REST endpoints for state inspection and fallback text/speech turns
+app.get("/api/state", (_req, res) => {
+  res.json({ business: BUSINESS, appointments, transfers, callHistory });
+});
+
+app.post("/api/turn", async (req, res) => {
+  try {
+    const { callId, message } = req.body as { callId?: string; message?: string };
+    if (!message || !message.trim()) {
+      res.status(400).json({ error: "Message text is required." });
+      return;
+    }
+
+    let call = callHistory.find((c) => c.id === callId);
+    if (!call) {
+      call = {
+        id: callId || createId("CALL"),
+        callerNumber: "(415) 555-0147",
+        startedAt: new Date().toISOString(),
+        status: "Active",
+        interruptionCount: 0,
+        transcript: [],
+        actions: [],
+      };
+      callHistory.unshift(call);
+    }
+
+    call.transcript.push({
+      id: createId("MSG"),
+      speaker: "Caller",
+      text: message.trim(),
+      timestamp: new Date().toISOString(),
+    });
+
+    const contents: Array<Record<string, unknown>> = call.transcript
+      .filter((entry) => entry.speaker !== "System")
+      .map((entry) => ({
+        role: entry.speaker === "Caller" ? "user" : "model",
+        parts: [{ text: entry.text }],
+      }));
+
+    let replyText = "";
+    let turnContents = contents;
+
+    for (let step = 0; step < 4; step++) {
+      const response = await client.models.generateContent({
+        model: "gemini-4-hydrogen",
+        contents: turnContents as never,
+        config: {
+          systemInstruction: buildSystemInstruction(),
+          tools: [{ functionDeclarations: RECEPTIONIST_TOOLS }],
+        },
+      });
+
+      const functionCalls = response.functionCalls;
+      if (functionCalls && functionCalls.length > 0) {
+        const modelContent = response.candidates?.[0]?.content;
+        if (modelContent) {
+          turnContents = [...turnContents, modelContent as unknown as Record<string, unknown>];
+        }
+        const responseParts = functionCalls.map((fc) => {
+          const output = executeTool(
+            fc.name ?? "",
+            (fc.args as Record<string, unknown>) ?? {},
+            call!
+          );
+          return {
+            functionResponse: {
+              id: fc.id,
+              name: fc.name ?? "",
+              response: output,
+            },
+          };
+        });
+        turnContents = [...turnContents, { role: "user", parts: responseParts }];
+        continue;
+      }
+
+      replyText = (response.text ?? "").trim();
+      break;
+    }
+
+    if (!replyText) {
+      replyText = "Thank you for holding. How else can I assist you today?";
+    }
+
+    call.transcript.push({
+      id: createId("MSG"),
+      speaker: "Receptionist",
+      text: replyText,
+      timestamp: new Date().toISOString(),
+    });
+
+    let audioBase64: string | undefined;
+    try {
+      const tts = await client.models.generateContent({
+        model: "gemini-3.8-flash-lite-tts",
+        contents: [{ role: "user", parts: [{ text: replyText }] }],
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
+          },
+        },
+      });
+      audioBase64 = tts.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    } catch {
+      audioBase64 = undefined;
+    }
+
+    res.json({
+      callId: call.id,
+      reply: replyText,
+      audioBase64,
+      appointments,
+      transfers,
+      call,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Failed to process call turn";
+    res.status(500).json({ error: msg });
+  }
+});
+
+// Serve embedded standalone console
+app.get("/", (_req, res) => {
+  res.type("html").send(EMBEDDED_HTML);
+});
+
+// ---------------------------------------------------------------------------
+// Real-Time Full-Duplex Voice WebSocket Bridge (/ws/call)
+// ---------------------------------------------------------------------------
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws/call" });
+
+wss.on("connection", async (ws: WebSocket) => {
+  const call: CallRecord = {
+    id: createId("CALL"),
+    callerNumber: "(415) 555-0199",
+    startedAt: new Date().toISOString(),
+    status: "Active",
+    interruptionCount: 0,
+    transcript: [],
+    actions: ["Call answered"],
+  };
+  callHistory.unshift(call);
+
+  let currentInputBuffer = "";
+  let currentOutputBuffer = "";
+  let sessionClosed = false;
+
+  const safeSend = (payload: Record<string, unknown>) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+    }
+  };
+
+  safeSend({ type: "call_started", callId: call.id });
+
+  try {
+    const liveSession = await client.live.connect({
+      model: "gemini-3.8-live",
+      config: {
+        responseModalities: [Modality.AUDIO],
+        speechConfig: {
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
+        },
+        inputAudioTranscription: {},
+        outputAudioTranscription: {},
+        tools: [{ functionDeclarations: RECEPTIONIST_TOOLS }],
+        systemInstruction: buildSystemInstruction(),
+      },
+      callbacks: {
+        onmessage: (message: LiveServerMessage) => {
+          const serverContent = message.serverContent;
+
+          if (serverContent?.interrupted) {
+            call.interruptionCount += 1;
+            if (currentOutputBuffer.trim()) {
+              call.transcript.push({
+                id: createId("MSG"),
+                speaker: "Receptionist",
+                text: currentOutputBuffer.trim(),
+                timestamp: new Date().toISOString(),
+                interrupted: true,
+              });
+              currentOutputBuffer = "";
+            }
+            call.actions.push("Caller interrupted receptionist");
+            safeSend({ type: "interrupted", count: call.interruptionCount });
+          }
+
+          if (serverContent?.inputTranscription?.text) {
+            currentInputBuffer += serverContent.inputTranscription.text;
+            safeSend({ type: "transcript_delta", speaker: "Caller", text: currentInputBuffer });
+          }
+
+          if (serverContent?.outputTranscription?.text) {
+            if (currentInputBuffer.trim()) {
+              const entry: TranscriptEntry = {
+                id: createId("MSG"),
+                speaker: "Caller",
+                text: currentInputBuffer.trim(),
+                timestamp: new Date().toISOString(),
+              };
+              call.transcript.push(entry);
+              safeSend({ type: "transcript_final", entry });
+              currentInputBuffer = "";
+            }
+            currentOutputBuffer += serverContent.outputTranscription.text;
+            safeSend({
+              type: "transcript_delta",
+              speaker: "Receptionist",
+              text: currentOutputBuffer,
+            });
+          }
+
+          for (const part of serverContent?.modelTurn?.parts ?? []) {
+            if (part.inlineData?.data) {
+              safeSend({ type: "audio", data: part.inlineData.data });
+            }
+          }
+
+          if (serverContent?.turnComplete) {
+            if (currentInputBuffer.trim()) {
+              const entry: TranscriptEntry = {
+                id: createId("MSG"),
+                speaker: "Caller",
+                text: currentInputBuffer.trim(),
+                timestamp: new Date().toISOString(),
+              };
+              call.transcript.push(entry);
+              safeSend({ type: "transcript_final", entry });
+              currentInputBuffer = "";
+            }
+            if (currentOutputBuffer.trim()) {
+              const entry: TranscriptEntry = {
+                id: createId("MSG"),
+                speaker: "Receptionist",
+                text: currentOutputBuffer.trim(),
+                timestamp: new Date().toISOString(),
+              };
+              call.transcript.push(entry);
+              safeSend({ type: "transcript_final", entry });
+              currentOutputBuffer = "";
+            }
+            safeSend({ type: "turn_complete" });
+          }
+
+          const functionCalls = message.toolCall?.functionCalls;
+          if (functionCalls && functionCalls.length > 0) {
+            const functionResponses = functionCalls.map((fc) => {
+              const result = executeTool(
+                fc.name ?? "",
+                (fc.args as Record<string, unknown>) ?? {},
+                call
+              );
+              safeSend({ type: "tool_event", name: fc.name, args: fc.args, result });
+              return {
+                id: fc.id,
+                name: fc.name ?? "",
+                response: result,
+              };
+            });
+            liveSession.sendToolResponse({ functionResponses });
+            safeSend({ type: "state_sync", appointments, transfers });
+          }
+        },
+        onerror: (err: ErrorEvent) => {
+          safeSend({ type: "error", message: err.message || "Voice stream error" });
+        },
+        onclose: () => {
+          sessionClosed = true;
+          safeSend({ type: "call_ended", callId: call.id });
+        },
+      },
+    });
+
+    // Prompt initial greeting as soon as line connects
+    liveSession.sendClientContent({
+      turns: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: "An incoming phone call just connected. Answer the phone politely with your standard greeting.",
+            },
+          ],
+        },
+      ],
+      turnComplete: true,
+    });
+
+    ws.on("message", (raw) => {
+      if (sessionClosed) return;
+      try {
+        const msg = JSON.parse(raw.toString()) as {
+          type?: string;
+          audio?: string;
+          text?: string;
+        };
+        if (msg.type === "audio" && msg.audio) {
+          liveSession.sendRealtimeInput({
+            audio: { data: msg.audio, mimeType: "audio/pcm;rate=16000" },
+          });
+        } else if (msg.type === "text" && msg.text) {
+          const entry: TranscriptEntry = {
+            id: createId("MSG"),
+            speaker: "Caller",
+            text: msg.text,
+            timestamp: new Date().toISOString(),
+          };
+          call.transcript.push(entry);
+          safeSend({ type: "transcript_final", entry });
+          liveSession.sendClientContent({
+            turns: [{ role: "user", parts: [{ text: msg.text }] }],
+            turnComplete: true,
+          });
+        }
+      } catch {
+        // Ignore malformed frame
+      }
+    });
+
+    ws.on("close", () => {
+      call.endedAt = new Date().toISOString();
+      if (call.status === "Active") call.status = "Completed";
+      if (!sessionClosed) {
+        sessionClosed = true;
+        liveSession.close();
+      }
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unable to start voice session";
+    safeSend({ type: "error", message });
+    ws.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Embedded Minimal Browser Voice Console
+// ---------------------------------------------------------------------------
+
+const EMBEDDED_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Meridian Voice Receptionist</title>
+  <style>
+    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f8fafc; color: #0f172a; padding: 24px; }
+    .wrap { max-width: 960px; margin: 0 auto; display: grid; gap: 20px; }
+    .panel { background: #fff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 20px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button { border: 1px solid #cbd5e1; background: #fff; color: #0f172a; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+    button.primary { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+    button.danger { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+    input { flex: 1; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; }
+    .log { max-height: 360px; overflow-y: auto; display: grid; gap: 10px; margin-top: 12px; }
+    .msg { padding: 10px 12px; border-radius: 8px; background: #f1f5f9; font-size: 14px; }
+    .msg.receptionist { background: #eff6ff; }
+    .meta { font-size: 12px; color: #64748b; margin-bottom: 4px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <div class="row" style="justify-content: space-between;">
+        <div>
+          <h2 style="margin:0 0 4px 0;">Meridian Health &amp; Dental Clinic</h2>
+          <div id="status" class="meta">Line idle</div>
+        </div>
+        <div class="row">
+          <button id="startBtn" class="primary">Answer Call</button>
+          <button id="bargeBtn" disabled>Interrupt</button>
+          <button id="endBtn" class="danger" disabled>End Call</button>
+        </div>
+      </div>
+      <div class="log" id="transcript"></div>
+      <form id="textForm" class="row" style="margin-top: 14px;">
+        <input id="textInput" placeholder="Or type a caller message..." />
+        <button type="submit">Send</button>
+      </form>
+    </div>
+    <div class="panel">
+      <h3 style="margin-top:0;">Appointments &amp; Transfers</h3>
+      <pre id="stateView" style="font-size:12px; overflow:auto; margin:0;"></pre>
+    </div>
+  </div>
+  <script>
+    let ws = null, inputCtx = null, outputCtx = null, mediaStream = null, processor = null;
+    let nextStartTime = 0, activeSources = [];
+    const statusEl = document.getElementById("status");
+    const transcriptEl = document.getElementById("transcript");
+    const stateEl = document.getElementById("stateView");
+    const startBtn = document.getElementById("startBtn");
+    const bargeBtn = document.getElementById("bargeBtn");
+    const endBtn = document.getElementById("endBtn");
+
+    function floatTo16BitPcmBase64(float32) {
+      const pcm = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      const bytes = new Uint8Array(pcm.buffer);
+      let bin = "";
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      return btoa(bin);
+    }
+
+    function stopPlayback() {
+      for (const src of activeSources) { try { src.stop(); } catch {} }
+      activeSources = [];
+      if (outputCtx) nextStartTime = outputCtx.currentTime;
+    }
+
+    function playPcm24k(base64) {
+      if (!outputCtx) return;
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const pcm16 = new Int16Array(bytes.buffer);
+      const audioBuf = outputCtx.createBuffer(1, pcm16.length, 24000);
+      const ch = audioBuf.getChannelData(0);
+      for (let i = 0; i < pcm16.length; i++) ch[i] = pcm16[i] / 32768;
+      const src = outputCtx.createBufferSource();
+      src.buffer = audioBuf;
+      src.connect(outputCtx.destination);
+      const startAt = Math.max(outputCtx.currentTime, nextStartTime);
+      src.start(startAt);
+      nextStartTime = startAt + audioBuf.duration;
+      activeSources.push(src);
+      src.onended = () => { activeSources = activeSources.filter((x) => x !== src); };
+    }
+
+    function appendMessage(speaker, text) {
+      const div = document.createElement("div");
+      div.className = "msg " + (speaker === "Receptionist" ? "receptionist" : "");
+      div.innerHTML = "<div class='meta'>" + speaker + "</div><div>" + text.replace(/</g, "&lt;") + "</div>";
+      transcriptEl.appendChild(div);
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
+
+    async function refreshState() {
+      const res = await fetch("/api/state");
+      const data = await res.json();
+      stateEl.textContent = JSON.stringify({ appointments: data.appointments, transfers: data.transfers }, null, 2);
+    }
+
+    startBtn.onclick = async () => {
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(proto + "://" + location.host + "/ws/call");
+      outputCtx = new AudioContext({ sampleRate: 24000 });
+      nextStartTime = outputCtx.currentTime;
+      statusEl.textContent = "Connecting line...";
+      startBtn.disabled = true;
+      endBtn.disabled = false;
+      bargeBtn.disabled = false;
+
+      ws.onopen = async () => {
+        statusEl.textContent = "Call active";
+        try {
+          inputCtx = new AudioContext({ sampleRate: 16000 });
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const src = inputCtx.createMediaStreamSource(mediaStream);
+          processor = inputCtx.createScriptProcessor(4096, 1, 1);
+          src.connect(processor);
+          processor.connect(inputCtx.destination);
+          processor.onaudioprocess = (e) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              const samples = e.inputBuffer.getChannelData(0);
+              ws.send(JSON.stringify({ type: "audio", audio: floatTo16BitPcmBase64(samples) }));
+            }
+          };
+        } catch {
+          statusEl.textContent = "Call active (microphone unavailable; use text input)";
+        }
+      };
+
+      ws.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === "audio") playPcm24k(msg.data);
+        if (msg.type === "interrupted") { stopPlayback(); statusEl.textContent = "Interrupted - listening"; }
+        if (msg.type === "transcript_final") appendMessage(msg.entry.speaker, msg.entry.text);
+        if (msg.type === "state_sync") refreshState();
+        if (msg.type === "error") statusEl.textContent = "Error: " + msg.message;
+      };
+
+      ws.onclose = () => {
+        stopPlayback();
+        if (processor) processor.disconnect();
+        if (mediaStream) mediaStream.getTracks().forEach((t) => t.stop());
+        if (inputCtx) inputCtx.close();
+        if (outputCtx) outputCtx.close();
+        startBtn.disabled = false;
+        endBtn.disabled = true;
+        bargeBtn.disabled = true;
+        statusEl.textContent = "Call ended";
+        refreshState();
+      };
+    };
+
+    bargeBtn.onclick = () => {
+      stopPlayback();
+      statusEl.textContent = "Playback interrupted - listening";
+    };
+
+    endBtn.onclick = () => { if (ws) ws.close(); };
+
+    document.getElementById("textForm").onsubmit = (e) => {
+      e.preventDefault();
+      const input = document.getElementById("textInput");
+      const text = input.value.trim();
+      if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+      stopPlayback();
+      ws.send(JSON.stringify({ type: "text", text }));
+      input.value = "";
+    };
+
+    refreshState();
+  </script>
+</body>
+</html>`;
+
+// Only listen when executed directly as the standalone script
+const isMainModule =
+  typeof process !== "undefined" &&
+  process.argv[1] &&
+  process.argv[1].endsWith("receptionist.ts");
+
+if (isMainModule) {
+  const PORT = Number(process.env.PORT || 3000);
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Meridian Voice Receptionist listening on http://localhost:${PORT}`);
+  });
+}
+
+export { server, app };
